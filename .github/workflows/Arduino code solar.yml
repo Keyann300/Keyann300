@@ -1,0 +1,142 @@
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiManager.h>
+#include <FirebaseESP32.h>
+
+Servo myservo;
+int pos = 95;
+String direction = "middle";
+int sens1 = 36;
+int sens2 = 39;
+int tolerance = 2;
+int hysteresis = 5;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define FIREBASE_HOST "gogo-32a9b-default-rtdb.firebaseio.com"
+#define FIREBASE_Authorization_key "AIzaSyDFyPxQcFSojaT9MI-mWHx6CawVmOkNPAE"
+
+FirebaseData firebaseData;
+
+const int numSamples = 5; // Number of samples to use for servo smoothing
+int servoPositions[numSamples]; // Array to store previous servo positions
+int servoIndex = 0; // Index to keep track of the array position
+
+unsigned long lastServoUpdate = 0; // Store the last time the servo was updated
+const unsigned long servoUpdateInterval = 5000; // Update the servo every 5 seconds
+
+unsigned long lastFirebaseUpdate = 0; // Store the last time Firebase was updated
+const unsigned long firebaseUpdateInterval = 10000; // Update Firebase every 10 seconds
+
+void setup() 
+{
+  myservo.attach(14);
+  pinMode(sens1, INPUT);
+  pinMode(sens2, INPUT);
+  myservo.write(pos);
+  delay(2000);
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.print("connecting...");
+
+  // Initialize WiFi Manager and connect to WiFi
+  WiFiManager wifiManager;
+  wifiManager.autoConnect("gogo"); // Customize SSID
+
+  lcd.init();
+  lcd.print("Connected");
+  delay(3000);
+  
+  // Initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_Authorization_key);
+
+  // Initialize Serial communication for debugging
+  Serial.begin(115200);
+  
+  // Initialize the servoPositions array with the current servo position
+  for (int i = 0; i < numSamples; i++) {
+    servoPositions[i] = pos;
+  }
+}
+
+void loop() 
+{
+  int val1 = analogRead(sens1);
+  int val2 = analogRead(sens2);
+  int ldr1Percentage = map(val1, 0, 4095, 0, 100); // Map LDR1 reading to percentage
+  int ldr2Percentage = map(val2, 0, 4095, 0, 100); // Map LDR2 reading to percentage
+
+  // Read battery voltage from GPIO pin 35 (analog input)
+  float batteryVoltage = analogRead(35) * (4.1 / 4095.0); // ESP32 ADC is 12-bit (0-4095)
+  int batteryPercentage = map(batteryVoltage, 3.7, 4.1, 0, 100);
+  batteryPercentage = constrain(batteryPercentage, 0, 100); // Constrain within a valid range
+
+  // Update the LCD display with LDR percentages and battery voltage
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" Solar Energy");
+
+  // Display LDR percentages on the second row
+  lcd.setCursor(0, 1);
+  lcd.print("s1:");
+  lcd.print(ldr1Percentage);
+  lcd.print("%  ");
+
+  lcd.setCursor(8, 1);
+  lcd.print("s2:");
+  lcd.print(ldr2Percentage);
+  lcd.print("%");
+
+  // Check for changes in LDR readings and update Firebase if necessary
+  if (abs(val1 - val2) <= tolerance) {
+    direction = "middle";
+  } else if (val1 > val2 + hysteresis) {
+    direction = "east";
+    pos = constrain(++pos, 50, 140); // Increment the position for east
+  } else if (val1 < val2 - hysteresis) {
+    direction = "west";
+    pos = constrain(--pos, 50, 140); // Decrement the position for west
+  }
+
+  // Restrict position to 85-110 degrees for the middle direction
+  if (direction == "middle") {
+    pos = constrain(pos, 85, 110);
+  }
+
+  // Update the servo at regular intervals or when there's a change in direction
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastServoUpdate >= servoUpdateInterval || pos != servoPositions[servoIndex]) {
+    lastServoUpdate = currentMillis;
+
+    // Add the current servo position to the array and update the index
+    servoPositions[servoIndex] = pos;
+    servoIndex = (servoIndex + 1) % numSamples;
+
+    // Calculate the average of the servo positions for smoother control
+    int averagePos = 0;
+    for (int i = 0; i < numSamples; i++) {
+      averagePos += servoPositions[i];
+    }
+    averagePos /= numSamples;
+
+    // Update the servo with the average position
+    myservo.write(averagePos);
+  }
+
+  // Check if enough time has passed since the last Firebase update
+  if (currentMillis - lastFirebaseUpdate >= firebaseUpdateInterval) {
+    lastFirebaseUpdate = currentMillis;
+
+    // Perform asynchronous Firebase updates
+    Firebase.setStringAsync(firebaseData, "data/solardirection", direction);
+    Firebase.setIntAsync(firebaseData, "data/ldr1Percentage", ldr1Percentage); // Add LDR1 percentage to Firebase
+    Firebase.setIntAsync(firebaseData, "data/ldr2Percentage", ldr2Percentage); // Add LDR2 percentage to Firebase
+    Firebase.setFloatAsync(firebaseData, "data/voltage", batteryVoltage); // Add battery voltage to Firebase
+    Firebase.setIntAsync(firebaseData, "data/percentage", batteryPercentage); // Add battery percentage to Firebase
+    Firebase.setIntAsync(firebaseData, "data/solarangle", pos); // Add servo angle to Firebase
+  }
+
+  delay(500); // A small delay to avoid excessive Firebase requests
+}
